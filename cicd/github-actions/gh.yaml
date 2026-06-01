@@ -1,0 +1,165 @@
+name: Build an image
+
+on:
+  push:
+    branches: 
+      [ main ]
+    paths:
+    - '**'
+    - '.github/workflows/gh.yaml'
+
+  # Allow manual trigger 
+  workflow_dispatch:
+
+env:
+  SERVICE_NAME: my-awesome-service
+  BUILD_ENV: dev
+  BRANCH_TO_CHECKOUT: main
+  REPO_WITH_ARGOCD_MANIFESTS: argo.apps
+  ARGOCD_APPLICATION_NAME: my-awesome-service
+  GITHUB_ORG: MyAwesomeGithubOrg
+
+      
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+
+    outputs:
+      image_was_built: ${{ steps.set_outputs.outputs.image_built }}
+
+    permissions:
+      id-token: write # Required to fetch the OIDC token
+      contents: read  # Required to check out the repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          base: main # name of a branch to track changes against
+          filters: |
+            code:
+              - '.github/workflows/gh.yaml'
+              - '**'
+              - 'Dockerfile'
+
+      - name: Free up disk space on runner
+        if: steps.filter.outputs.code == 'true'
+        run: |
+          echo "Starting disk space:"
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker image prune --all --force
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # The AWS region of your ECR repository
+          aws-region: my-awesome-region
+
+          # ARN of the role to assume in AWS account where to push the image
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+
+      - name: Login to Amazon ECR
+        if: steps.filter.outputs.code == 'true'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        if: steps.filter.outputs.code == 'true'
+        id: build_and_push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          provenance: false
+          platforms: linux/arm64
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.SERVICE_NAME }}-${{ env.BUILD_ENV }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Set Job Outputs
+        if: steps.build_and_push.outcome == 'success'
+        id: set_outputs
+        run: |
+          echo "image_built=true" >> "$GITHUB_OUTPUT"
+
+
+  update-external-repo:
+    name: Update Image Tag in repository where ArgoCD manifests are kept
+    runs-on: ubuntu-latest
+    environment: dev
+
+    needs: build-and-deploy
+    # Add this condition to prevent running unnecessarily, e.g. if there are no code changes then previous job will succeed
+    # but we do not want to set a new tag based on SHA1 in this case
+    if: needs.build-and-deploy.outputs.image_was_built == 'true'
+
+    steps:
+      - name: Generate token from GitHub App
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GHA_APP_ID }}
+          private-key: ${{ secrets.GHA_APP_PRIVATE_KEY }}
+          owner: ${{ env.GITHUB_ORG }}
+          repositories: ${{ env.REPO_WITH_ARGOCD_MANIFESTS }}
+      # Check out the target repository from the different org
+      - name: Checkout k8s-resources repository
+        uses: actions/checkout@v4
+        with:
+          # Specify the owner and repository name
+          repository: ${{ env.GITHUB_ORG }}/${{ env.REPO_WITH_ARGOCD_MANIFESTS }}
+          
+          # Provide a token that has write access to that repository
+          token: ${{ steps.generate_token.outputs.token }}
+
+          ref: ${{ env.BRANCH_TO_CHECKOUT }}
+          
+          # IMPORTANT: Check it out into a specific subdirectory
+          path: ${{ env.REPO_WITH_ARGOCD_MANIFESTS }}
+          
+     
+      # Install yq
+      - name: Install yq
+        run: |
+          sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
+
+      # Update imageTag in values.yaml
+      # This safely modifies the YAML structure without relying on text patterns.
+      - name: Update imageTag with yq
+        run: |
+          yq -i '.imageTag = "${{ github.sha }}"' "${{ env.REPO_WITH_ARGOCD_MANIFESTS }}/${{ env.ARGOCD_APPLICATION_NAME }}/kustomize.yaml"
+
+      # Step 4: Commit and push the changes from within the target repo's directory
+      - name: Commit and push changes
+        # Use 'working-directory' to run git commands inside the checked-out repo
+        working-directory: ${{ env.REPO_WITH_ARGOCD_MANIFESTS }}
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          # The path here is now relative to the working-directory
+          git add "${{ env.ARGOCD_APPLICATION_NAME }}/kustomize.yaml"
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update imageTag for the ${{ env.SERVICE_NAME }} to ${{ github.sha }}"
+            git push
+
+          fi
