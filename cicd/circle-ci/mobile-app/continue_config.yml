@@ -1,0 +1,225 @@
+version: 2.1
+
+orbs:
+  node: circleci/node@5.2.0
+
+# the default pipeline parameters, which will be updated according to the results of the pre-build job
+parameters:
+  build-for-ios:
+    type: boolean
+    default: false
+  build-for-android:
+    type: boolean
+    default: false
+
+
+jobs:
+  build-android:
+    docker:
+      - image: europe-west2-docker.pkg.dev/my-gcp-project/k8s-docker-images/circleci/android:node-12.18.2
+        auth:
+          username: _json_key
+          password: $CCI_GCLOUD_SERVICE_KEY
+    resource_class: large
+    environment:
+      GRADLE_CONFIG_GCP_SECRET_NAME: mobile-app-gradle-config
+      KEYSTORE_FILE_GCP_SECRET_NAME: mobile-app-keystore
+    steps:
+      - checkout
+      - run:
+          name: Auth to GCP
+          command: |
+            sudo apt-get install jq -y
+            echo "$CCI_GCLOUD_SERVICE_KEY" > /tmp/sa.json
+            gcloud auth activate-service-account $(jq -r '.client_email' /tmp/sa.json) --key-file=/tmp/sa.json --project=my-gcp-project
+      - run:
+          name: Patch build-tools v31
+          command: |
+            cd /home/circleci/android-sdk/build-tools/31.0.0/
+            cp d8 dx
+            cp ./lib/d8.jar ./lib/dx.jar
+      - run:
+          name: Configure npm
+          command: |
+            npm config set registry https://npm-proxy.fury.io/<id>/<org>
+            npm config set ca ''
+      - run: npm i
+      - run:
+          name: set gradle.properties
+          command: mkdir $HOME/.gradle && echo 'org.gradle.daemon=false' >> $HOME/.gradle/gradle.properties
+      - run:
+          name: Get and store Java keystore
+          command: |
+            gcloud secrets versions access latest --secret=$KEYSTORE_FILE_GCP_SECRET_NAME | base64 -d > $HOME/project/android/app/com.myawesomeorg.mobileapp.keystore
+      - run:
+          name: set keystore in gradle.properties
+          command: gcloud secrets versions access latest --secret=$GRADLE_CONFIG_GCP_SECRET_NAME > $HOME/.gradle/gradle.properties
+      - run:
+          name: create bundle file
+          command: |
+            npx react-native bundle --platform android \
+            --dev true \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+      - run:
+          name: Assemble debug build
+          command: cd android && ./gradlew assembleDebug --info
+      - run:
+          name: Distribute APK to Firebase - Init Phase
+          command: |
+            # Install Firebase CLI
+            curl -sL firebase.tools | bash
+      - run:
+          name: Distribute APK to Firebase - Release Phase
+          command: |
+            # Distribute the release
+            SA_LOCATION=/tmp/pipeline-sa.json
+            echo "$CCI_GCLOUD_SERVICE_KEY" > $SA_LOCATION
+
+            MANIFEST_FILENAME=$HOME/project/app.json
+
+            [[ -f $MANIFEST_FILENAME ]] || {
+              OUT_NAME='my.awesome.mobile.app'
+              OUT_DIR='gb'
+            } && {
+              OUT_NAME=$(jq -r '.output_name' $MANIFEST_FILENAME)
+              OUT_DIR=$(jq -r '.output_dir' $MANIFEST_FILENAME)
+            }
+
+            # Get App ID
+            echo "$FIREBASE_APP_ID_ANDROID" > /tmp/app_ids.json
+            FIREBASE_APP_ID=$(jq -r --arg tenant $OUT_DIR '.[$tenant]' /tmp/app_ids.json)
+
+            export GOOGLE_APPLICATION_CREDENTIALS=$SA_LOCATION
+
+            cd $HOME/project/android/app/build/outputs/apk/debug
+            apk_name_new=app-debug-$CIRCLE_BRANCH-$CIRCLE_SHA1.apk
+            mv app-debug.apk $apk_name_new
+
+            firebase appdistribution:distribute $HOME/project/android/app/build/outputs/apk/debug/$apk_name_new \
+              --app $FIREBASE_APP_ID \
+              --release-notes "Distributed by CircleCI, built on $(date).\nBranch: $CIRCLE_BRANCH\nCommit: $CIRCLE_SHA1\n\nLots of amazing new features to test out!" \
+              --groups releasepipeline
+
+  
+  build-ios:
+    macos:
+      xcode: 14.2.0
+    resource_class: macos.m1.medium.gen1
+    environment:
+      FL_OUTPUT_DIR: outputs # artifact directory where FastLane logs should be stored
+      RUBY_VER: 2.7.4
+    steps:
+      - run:
+          name: Install build binaries
+          command: brew install jq
+      - run:
+          name: Install Ruby 2.7.4
+          command: rbenv install $RUBY_VER
+      - run:
+          name: Set Ruby Version
+          command: rbenv global $RUBY_VER && rbenv rehash
+      - node/install:
+          install-yarn: false
+          node-version: 'v16.20.2'
+      - run:
+          name: npm config
+          command: |
+            npm config set registry https://npm-proxy.fury.io/<id>/<org>
+            npm config set ca ''
+            npm set strict-ssl false
+      - checkout
+      - run:
+          name: npm Install
+          command: npm i --legacy-peer-deps
+      - run:
+          name: Add bundler v2.2.27
+          command: gem install bundler:2.2.27
+      - run:
+          name: Install cocoapods using bundler v2.2.27
+          command: bundle _2.2.27_ install
+      - run:
+          name: install ios pods
+          command: pod install
+          working_directory: ios
+      - run:
+          name: Install fastlane using bundler v2.2.27
+          command: bundle _2.2.27_ install
+          working_directory: ios
+      - run:
+          name: Build IPA
+          command: |
+            MANIFEST_FILENAME=$HOME/project/app.json
+
+            [[ -f $MANIFEST_FILENAME ]] || {
+              APP_ID='com.myawesomeorg.com'
+              MATCH_TYPE='adhoc'
+              OUT_NAME='myawesomeorg.mobile.app'
+              OUT_DIR='gb'
+            } && {
+              echo "Contents of $MANIFEST_FILENAME"
+              jq . $MANIFEST_FILENAME
+
+              APP_ID=$(jq -r '.app_identifier' $MANIFEST_FILENAME)
+              MATCH_TYPE=$(jq -r '.match_type' $MANIFEST_FILENAME)
+              OUT_NAME=$(jq -r '.output_name' $MANIFEST_FILENAME)
+              OUT_DIR=$(jq -r '.output_dir' $MANIFEST_FILENAME)
+            }
+
+            fastlane build_ipa \
+              match_type:$MATCH_TYPE \
+              app_identifier:$APP_ID \
+              output_directory:$HOME/project/ios/outputs/ipa/release/$OUT_DIR \
+              output_name:$OUT_NAME
+          working_directory: ios
+      - run:
+          name: Distribute IPA to Firebase - Init Phase
+          command: |
+            # Install Firebase CLI using homebrew
+            brew install firebase-cli
+
+            # Add distribution plugin
+            fastlane add_plugin firebase_app_distribution
+          working_directory: ios
+      - run:
+          name: Distribute IPA to Firebase - Release Phase
+          command: |
+            # Distribute the release
+            SA_LOCATION=/tmp/pipeline-sa.json
+            echo "$CCI_GCLOUD_SERVICE_KEY" > $SA_LOCATION
+
+            MANIFEST_FILENAME=$HOME/project/app.json
+
+            [[ -f $MANIFEST_FILENAME ]] || {
+              OUT_NAME='my.awesome.mobile.app'
+              OUT_DIR='gb'
+            } && {
+              OUT_NAME=$(jq -r '.output_name' $MANIFEST_FILENAME)
+              OUT_DIR=$(jq -r '.output_dir' $MANIFEST_FILENAME)
+            }
+
+            # Get App ID
+            echo "$FIREBASE_APP_ID_IOS" > /tmp/app_ids.json
+            FIREBASE_APP_ID=$(jq -r --arg tenant $OUT_DIR '.[$tenant]' /tmp/app_ids.json)
+
+            fastlane publish_to_firebase \
+              service_account_key:$SA_LOCATION \
+              app_id:$FIREBASE_APP_ID \
+              notes:"Distributed by CircleCI, built on $(date).\nBranch: $CIRCLE_BRANCH\nCommit: $CIRCLE_SHA1\n\nLots of amazing new features to test out!" \
+              ipa_path:$HOME/project/ios/outputs/ipa/release/$OUT_DIR/$OUT_NAME.ipa
+          working_directory: ios
+
+
+# here we specify our workflows, most of which are conditionally
+# executed based upon pipeline parameter values. Each workflow calls a
+# specific job defined above, in the jobs section.
+workflows:
+  build-android:
+    when: << pipeline.parameters.build-for-android >>
+    jobs:
+      - build-android
+  build-ios:
+    when: << pipeline.parameters.build-for-ios >>
+    jobs:
+      - build-ios

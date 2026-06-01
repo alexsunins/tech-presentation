@@ -1,0 +1,301 @@
+version: 2.1
+
+orbs:
+  gcp-cli: circleci/gcp-cli@3.1.0
+
+commands:
+  gcp-oidc-generate-cred-config-file:
+    description: "Authenticate with GCP using a CircleCI OIDC token."
+    parameters:
+      project_id:
+        type: env_var_name
+        default: GCP_PROJECT_ID
+      workload_identity_pool_id:
+        type: env_var_name
+        default: GCP_WIP_ID
+      workload_identity_pool_provider_id:
+        type: env_var_name
+        default: GCP_WIP_PROVIDER_ID
+      service_account_email:
+        type: string
+        default: ms-admin-cci-sa@my-gcp-project.iam.gserviceaccount.com
+      gcp_cred_config_file_path:
+        type: string
+        default: /home/circleci/gcp_cred_config.json
+      oidc_token_file_path:
+        type: string
+        default: /home/circleci/oidc_token.json
+    steps:
+      - run:
+          name: Process OIDC token
+          command: |
+            mkdir -p /home/circleci
+
+            # Store OIDC token in temp file
+            echo $CIRCLE_OIDC_TOKEN > << parameters.oidc_token_file_path >>
+
+            # Create a credential configuration for the generated OIDC ID Token
+            gcloud iam workload-identity-pools create-cred-config \
+                "projects/${<< parameters.project_id >>}/locations/global/workloadIdentityPools/${<< parameters.workload_identity_pool_id >>}/providers/${<< parameters.workload_identity_pool_provider_id >>}"\
+                --output-file="<< parameters.gcp_cred_config_file_path >>" \
+                --service-account="<< parameters.service_account_email >>" \
+                --credential-source-file=<< parameters.oidc_token_file_path >>
+
+  gcp-oidc-authenticate:
+    description: "Authenticate with GCP using a GCP credentials file."
+    parameters:
+      gcp_cred_config_file_path:
+        type: string
+        default: /home/circleci/gcp_cred_config.json
+    steps:
+      - run:
+          name: Authenticate with GCP using a GCP credentials file
+          command: |
+            # Configure gcloud to leverage the generated credential configuration
+            gcloud auth login --brief --cred-file "<< parameters.gcp_cred_config_file_path >>"
+
+            # Configure ADC
+            echo "export GOOGLE_APPLICATION_CREDENTIALS='<< parameters.gcp_cred_config_file_path >>'" | tee -a "$BASH_ENV"
+
+  install_build_binaries:
+    steps:
+      - run:
+          name: Install build binaries
+          command: apt-get update && apt-get install -y apt-transport-https ca-certificates curl gnupg
+  
+  install_docker:
+    steps:
+      - run:
+          name: Install docker
+          command: |
+            curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+  
+  install_docker_compose:
+    parameters:
+      compose-version:
+        type: string
+    steps:
+      - run:
+          name: Install docker-compose
+          command: |
+            curl -L "https://github.com/docker/compose/releases/download/<< parameters.compose-version >>/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+
+            chmod +x /usr/local/bin/docker-compose
+  
+  docker_login:
+    steps:
+      - run:
+          name: docker login
+          command: |
+            gcloud auth configure-docker europe-west2-docker.pkg.dev
+  
+  docker_load_cache:
+    steps:
+      - run:
+          name: Load Docker image layer cache
+          command: |
+            set +o pipefail
+            docker load -i /caches/app.tar | true
+
+  set_node_env:
+    steps:
+      - run:
+          name: set NODE_ENV
+          command: |
+            NODE_ENV=development
+            for x in master canary; do [[ $CIRCLE_BRANCH == $x ]] && NODE_ENV=production; done
+
+            echo "export NODE_ENV=$NODE_ENV" >> /tmp/node-env
+  
+  docker_build_application_image:
+    steps:
+      - run:
+          name: Build application Docker image
+          command: |
+            source /tmp/node-env
+
+            docker build  --cache-from=$CIRCLE_PROJECT_REPONAME \
+                          --build-arg NPM_REGISTRY=$NPM_REGISTRY \
+                          --build-arg NODE_ENV=$NODE_ENV \
+                          --build-arg COMMIT=$CIRCLE_SHA1 \
+                          -t $CIRCLE_PROJECT_REPONAME .
+
+  docker_save_cache:
+    steps:
+      - run:
+          name: Prep Docker image layer cache for uploading
+          command: |
+            mkdir -p /caches
+            docker save -o /caches/app.tar $CIRCLE_PROJECT_REPONAME
+
+  docker_compose_run_unit_tests:
+    steps:
+      - run:
+          name: Run Unit test
+          command: |
+            docker tag $CIRCLE_PROJECT_REPONAME unit-test && \
+            docker-compose -f ./docker-compose.yml run unit-test
+
+  docker_compose_run_integration_tests:
+    steps:
+      - run:
+          name: Run Integration test
+          command: |
+            docker tag $CIRCLE_PROJECT_REPONAME integration-test && \
+            docker-compose -f ./docker-compose.yml run integration-test 
+  
+  docker_push_image_to_gcp:
+    steps:
+      - run:
+          name: Push Docker image to GCP
+          command: |
+            source /tmp/node-env
+
+            AR_IMAGE_REPOSITORY=$(echo $CIRCLE_PROJECT_REPONAME | tr '.' '-')
+            image_name="$AR_HOST_NAME/$AR_PROJECT_ID/k8s-docker-images/$AR_IMAGE_REPOSITORY"
+
+            IMAGE_TAG=$(printf $CIRCLE_BRANCH | sed -e 's/.*\/\|\.//g')-$NODE_ENV-$CIRCLE_SHA1-tRgx$(date +%s)
+
+            docker tag $CIRCLE_PROJECT_REPONAME $image_name:$IMAGE_TAG && \
+            docker push $image_name:$IMAGE_TAG
+
+            # adding `next` tag to the new image
+            gcloud artifacts docker tags add $image_name:$IMAGE_TAG $image_name:next
+
+            echo "export NEW_IMAGE_TAG=$IMAGE_TAG" >> /tmp/image-tag
+            echo "export AR_IMAGE_REPOSITORY=$image_name" >> /tmp/image-tag
+ 
+  collect_environment_variables:
+    steps:
+      - run:
+          name: Prep env vars to be shared between jobs
+          command: |
+            cat /tmp/node-env /tmp/image-tag > /tmp/env-vars
+
+  git_commit_to_argo_apps:
+    parameters:
+      overlays_to_update:
+        type: string
+    steps:
+      - run:
+          name: Update image tags in the argo.apps repository
+          command: |
+            git config --global user.email "circleci@mydomain.com"
+            git config --global user.name "circleci-machine-user"
+
+            source /tmp/env-vars
+
+            ARGO_ENV_TO_UPDATE=$NODE_ENV
+            [[ $NODE_ENV == development ]] && ARGO_ENV_TO_UPDATE=staging
+
+            git clone https://$CCI_MACHINE_USER_PAT@github.com/myghorg/argo.apps.git
+            cd argo.apps
+
+            ARGO_MASTER_BRANCH_NAME='master'
+            [[ -z $(git branch | grep main | tr -d '*'| xargs ) ]] || ARGO_MASTER_BRANCH_NAME='main'
+            git checkout $ARGO_MASTER_BRANCH_NAME && git pull && git fetch --tags -f
+
+            LOCAL_BRANCH_NAME=cci-$CIRCLE_SHA1
+            git checkout -b $LOCAL_BRANCH_NAME
+            
+            for o in << parameters.overlays_to_update >>; do
+              cd ./$o/$ARGO_ENV_TO_UPDATE/$CIRCLE_PROJECT_REPONAME
+              /tmp/kustomize edit set image $AR_IMAGE_REPOSITORY=$AR_IMAGE_REPOSITORY:$NEW_IMAGE_TAG
+              cd -
+            done
+
+            git add --all
+            git commit -m "Updated image tag to $NEW_IMAGE_TAG"
+
+            git push origin $LOCAL_BRANCH_NAME:$ARGO_MASTER_BRANCH_NAME
+
+
+jobs:
+  build_test_and_push:
+    docker:
+      - image: python:3.11.7-slim
+    parameters:
+      compose-version:
+        type: string
+    steps:
+      - install_build_binaries
+      - gcp-cli/install
+      - gcp-oidc-generate-cred-config-file
+      - gcp-oidc-authenticate
+      - install_docker
+      - install_docker_compose:
+          compose-version: << parameters.compose-version >>
+      - setup_remote_docker
+      - docker_login
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-{{ .Branch }}
+          paths:
+            - /caches/app.tar
+      - docker_load_cache
+      - set_node_env
+      - docker_build_application_image
+      - docker_save_cache
+      - save_cache:
+          key: v1-{{ .Branch }}-{{ epoch }}
+          paths:
+            - /caches/app.tar
+      - docker_compose_run_unit_tests
+      - docker_compose_run_integration_tests
+      - docker_push_image_to_gcp
+      - when:
+          condition:
+            or:
+              - equal: [ master, << pipeline.git.branch >> ]
+              - equal: [ development, << pipeline.git.branch >> ]
+          steps:
+            - collect_environment_variables
+            - persist_to_workspace:
+                root: /tmp
+                paths:
+                  - env-vars
+
+
+  deploy_with_argocd:
+    docker:
+      - image: alpine:3.19.1
+    parameters:
+      overlays_to_update:
+        type: string
+    steps:
+      - attach_workspace:
+          at: /tmp
+      - run:
+          name: Install build binaries
+          command: |
+            apk add curl git bash && \
+            curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"  | bash && \
+            bash -c "mv $(echo ${CIRCLE_WORKING_DIRECTORY/#\~/$HOME})/kustomize /tmp/kustomize"
+      - git_commit_to_argo_apps:
+          overlays_to_update: << parameters.overlays_to_update >>
+
+
+workflows:
+  build:
+    jobs:
+      - build_test_and_push:
+          compose-version: "1.24.1"
+          context:
+          - artifact-registry
+          - gcp-oidc
+      - deploy_with_argocd:
+          requires:
+            - build_test_and_push
+          overlays_to_update: "overlays/gb overlays/au overlays/uk"
+          filters:
+            branches:
+              only:
+                - master
+                - development
+          context:
+            - argo.apps
+            - artifact-registry
