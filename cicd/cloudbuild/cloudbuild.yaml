@@ -1,0 +1,19 @@
+steps:
+  - id: Prep Dockerfile 
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - ./Dockerfile-build-bash.sh
+      - $_COUNTRY_CODE
+      - $_DOCKERFILE_ENV
+  - id: Build, scan and push Docker image
+    name: # here goes path to a custom docker image that has Trivvy packed with the CI/CD scripts #
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        ./ci-cd/build.sh $_APP_NAME $_COUNTRY_CODE $_DOCKER_IMAGE_ENV $_TAG && \
+        ./ci-cd/scan.sh $_SCAN_FOR_VULNERABILITIES $_APP_NAME:latest && \
+        ./ci-cd/push.sh $_APP_NAME $_COUNTRY_CODE $_DOCKER_IMAGE_ENV
+options:
+  logging: CLOUD_LOGGING_ONLY

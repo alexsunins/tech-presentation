@@ -1,0 +1,54 @@
+version: 2.1
+
+
+# this allows you to use CircleCI's dynamic configuration feature
+setup: true
+
+# the continuation orb is required in order to use dynamic configuration
+orbs:
+  continuation: circleci/continuation@0.1.2
+
+jobs:
+  pre-build:
+    executor: continuation/default
+    parameters:
+      BUILD_PARAM_OUT_FILE_PATH:
+        type: string
+        default: '/tmp/build_params.json'
+    steps:
+      - checkout
+      - run:
+          name: Process commit message
+          environment:
+            APK_BUILD: "false"
+            IPA_BUILD: "false"
+            BUILD_TRIGGER_APK: '\<<apk>>'
+            BUILD_TRIGGER_IOS: '\<<ipa>>'
+          command: |
+            COMMIT_MSG=$(git log -1 --pretty=%B | xargs)
+            printf '%s\n"%s"' 'Got commit message' "$COMMIT_MSG"
+
+            [[ $COMMIT_MSG == *$BUILD_TRIGGER_APK* ]] && APK_BUILD='true'
+            [[ $COMMIT_MSG == *$BUILD_TRIGGER_IOS* ]] && IPA_BUILD='true'
+
+            printf '{"build-for-ios": %s, "build-for-android": %s}' $IPA_BUILD $APK_BUILD > << parameters.BUILD_PARAM_OUT_FILE_PATH >>
+
+            printf '\n%s\n\t%s\n\n' 'Contents of << parameters.BUILD_PARAM_OUT_FILE_PATH >> > ' "$(cat << parameters.BUILD_PARAM_OUT_FILE_PATH >>)"
+
+            [[ $APK_BUILD == 'false' ]] && [[ $IPA_BUILD == 'false' ]] && {
+                printf '%s\n\n'   'WARNING: No build environment requested in the commit message'
+                printf '%s\n'     "To build iOS release please add $BUILD_TRIGGER_IOS to the commit message"
+                printf '%s\n'     "To build Android release please add $BUILD_TRIGGER_APK to the commit message"
+                printf '\n%s\n\n' 'Examples:'
+                printf '%s\n'     "$BUILD_TRIGGER_APK Building Android prod release"
+                printf '%s\n'     "$BUILD_TRIGGER_IOS Building iOS staging release"
+            } || exit 0
+      - continuation/continue:
+          configuration_path: .circleci/continue_config.yml
+          parameters: << parameters.BUILD_PARAM_OUT_FILE_PATH >>
+
+# our single workflow, that triggers the setup job defined above
+workflows:
+  pre-build:
+    jobs:
+      - pre-build
