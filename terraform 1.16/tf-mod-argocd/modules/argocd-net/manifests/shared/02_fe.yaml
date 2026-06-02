@@ -1,0 +1,10 @@
+apiVersion: networking.gke.io/v1beta1
+kind: FrontendConfig
+metadata:
+  name: ${fe_config_name}
+  namespace: ${namespace_name}
+labels:
+    fingerprint: ${manifest_fingerprint}
+spec:
+  redirectToHttps:
+    enabled: true
