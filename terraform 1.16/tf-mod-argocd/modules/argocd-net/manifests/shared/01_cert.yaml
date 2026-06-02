@@ -1,0 +1,8 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: ${ssl_certificate_name}
+  namespace: ${namespace_name}
+spec:
+  domains:
+    - ${dns_name}

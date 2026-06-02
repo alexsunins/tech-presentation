@@ -1,3 +1,3 @@
 # CI-CD
 
-CI-CD stuff that I have done in my career.
+CI-CD stuff that I have done in my career. Well before AI psychosis.

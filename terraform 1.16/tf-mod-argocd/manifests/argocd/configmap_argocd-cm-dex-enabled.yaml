@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+  namespace: ${namespace_name}
+  name: argocd-cm
+data:
+  # Application reconciliation timeout is the max amount of time required to discover if a new manifests version got
+  # published to the repository. Reconciliation by timeout is disabled if timeout is set to 0. Three minutes by default.
+  # > Note: argocd-repo-server deployment must be manually restarted after changing the setting.
+  timeout.reconciliation: ${timeout_reconciliation}
+  application.resourceTrackingMethod: ${resource_tracking_method}
+  exec.enabled: '${pod_exec}'
+  url: "https://${dns_name}"
+  dex.config: |
+    connectors:
+    - config:
+        redirectURI: https://${dns_name}/api/dex/callback
+        clientID: ${dex_client_id}
+        clientSecret: ${dex_client_secret}
+        serviceAccountFilePath: /tmp/oidc/googleAuth.json
+        adminEmail: ${dex_admin_email}
+      type: google
+      id: google
+      name: Google

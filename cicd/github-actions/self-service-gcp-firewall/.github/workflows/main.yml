@@ -1,0 +1,70 @@
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+# GitHub recommends pinning actions to a commit SHA.
+# To get a newer version, you will need to update the SHA.
+# You can also reference a tag or branch, but the action may change without warning.
+
+name: Trigger a cron in GKE
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: ${{ secrets.GKE_PROJECT }}
+  GKE_CLUSTER: my-awesome-gke-cluster   # Add your cluster name here.
+  GKE_ZONE: europe-west1-b   # Add your cluster zone here.
+
+jobs:
+  trigger-cron:
+    name: Trigger maintenance cron
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Auth gcloud CLI
+    - uses: 'google-github-actions/auth@v2'
+      with:
+        service_account: 'gh-2-gcp-intgrtn@my-project.iam.gserviceaccount.com'
+        workload_identity_provider: 'projects/<PROJECT_ID>/locations/global/workloadIdentityPools/github/providers/github-prvdr'
+
+    # Setup gcloud CLI
+    - uses: 'google-github-actions/setup-gcloud@v2'
+      with:
+        version: '>= 363.0.0'
+
+    - name: Get kproxy zone
+      run: |
+        echo "instance_location=$( gcloud compute instances list --filter='name: gke-${{ env.GKE_CLUSTER }}-kproxy' --format='value(zone)')" >> $GITHUB_ENV
+    - name: Create a secure tunnel using IAP and SSH
+      run: |
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        gcloud compute ssh gke-${{ env.GKE_CLUSTER }}-kproxy --tunnel-through-iap --project=${{ secrets.GKE_PROJECT }} --zone=$instance_location -- -4 -fNTL 8888:localhost:8888
+
+    
+    # Get the GKE credentials so we can deploy to the cluster
+    - id: 'get-gke-credentials'
+      uses: 'google-github-actions/get-gke-credentials@v2'
+      with:
+        cluster_name: ${{ env.GKE_CLUSTER }}
+        location: ${{ env.GKE_ZONE }}
+        use_internal_ip: true
+    - name: Set proxy-url flag
+      run: |
+        kubectl config set-cluster ${{ env.GKE_CLUSTER }} --proxy-url="http://localhost:8888"
+
+
+    # Trigger cron in GKE
+    - name: Trigger maintenance cron
+      run: |-
+        kubectl -n firewall-self-service create job update-fw-$(date +%s) --from=cj/gcp-firewall

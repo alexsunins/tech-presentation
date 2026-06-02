@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: argocd-google-groups-json
+  namespace: ${namespace_name}
+data:
+  googleAuth.json: ${json_file_base64_encoded}

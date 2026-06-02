@@ -1,0 +1,12 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: ${becfg_name}
+  namespace: ${namespace_name}
+  labels:
+    fingerprint: ${manifest_fingerprint}
+spec:
+  iap:
+    enabled: true
+    oauthclientCredentials:
+      secretName: ${k8s_secret_for_oauth}
